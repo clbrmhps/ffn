@@ -17,6 +17,11 @@ from scipy.stats import t
 from sklearn.utils import resample
 from tabulate import tabulate
 
+from portfolio_construction.optimization import get_mv_frontier
+from portfolio_construction.calculations import pf_mu
+from portfolio_construction.calculations import pf_sigma
+from analysis.drawdowns import endpoint_mdd_lookup
+
 from . import utils
 from .utils import fmtn, fmtp, fmtpn, get_freq_name
 
@@ -32,6 +37,69 @@ _PANDAS_TWO = Version(pd.__version__) >= Version("2")
 # module level variable, can be different for non traditional markets (eg. crypto - 360)
 TRADING_DAYS_PER_YEAR = 252
 
+def calculate_portfolio_properties(caaf_weights, arithmetic_mu, covar):
+    # Align weights and arithmetic mean returns
+    aligned_weights, aligned_mu = caaf_weights.align(arithmetic_mu, join='inner')
+
+    # Calculate portfolio metrics
+    portfolio_arithmetic_mu = pf_mu(aligned_weights, aligned_mu)
+    portfolio_sigma = pf_sigma(aligned_weights, covar)
+    portfolio_geo_mu = portfolio_arithmetic_mu - 0.5 * portfolio_sigma ** 2
+    portfolio_md = endpoint_mdd_lookup(portfolio_geo_mu, portfolio_sigma, frequency='M', percentile=5)
+
+    # Compile portfolio properties into a pandas Series
+    portfolio_properties = pd.Series({
+        'arithmetic_mu': portfolio_arithmetic_mu,
+        'sigma': portfolio_sigma,
+        'md': portfolio_md
+    })
+
+    return portfolio_properties
+
+def add_additional_constraints(constraints, additional_constraints):
+    if additional_constraints is None:
+        return constraints
+
+    if 'alternatives_upper_bound' in additional_constraints:
+        alternatives_upper_bound = additional_constraints['alternatives_upper_bound']
+        constraints.append({
+            'type': 'ineq',
+            'fun': lambda w: alternatives_upper_bound - w[5],
+            'name': 'Alternatives Constraint'
+        })
+
+    if 'em_equities_upper_bound' in additional_constraints:
+        em_equities_upper_bound = additional_constraints['em_equities_upper_bound']
+        constraints.append({
+            'type': 'ineq',
+            'fun': lambda w: (w[0] + w[1]) * em_equities_upper_bound - w[1],
+            'name': 'EM Equities Constraint'
+        })
+
+    if 'hy_credit_upper_bound' in additional_constraints:
+        hy_credit_upper_bound = additional_constraints['hy_credit_upper_bound']
+        constraints.append({
+            'type': 'ineq',
+            'fun': lambda w: hy_credit_upper_bound - w[2],
+            'name': 'HY Credit Constraint'
+        })
+
+    return constraints
+
+def drop_starting_duplicates(s: pd.Series, value) -> pd.Series:
+    """
+    Drop duplicates of the specified value only if they are at the start of the series.
+
+    Parameters:
+    - s (pd.Series): Input pandas Series
+    - value: Value whose starting duplicates need to be removed
+
+    Returns:
+    - pd.Series: Series with the starting duplicates of the specified value removed
+    """
+    while len(s) > 0 and s.iloc[0] == value:
+        s = s.drop(s.index[0])
+    return s
 
 class PerformanceStats(object):
     """
@@ -59,7 +127,8 @@ class PerformanceStats(object):
 
     def __init__(self, prices, rf=0.0, annualization_factor=TRADING_DAYS_PER_YEAR):
         super(PerformanceStats, self).__init__()
-        self.prices = prices
+        self.prices = drop_starting_duplicates(prices, 100.0)
+
         self.name = self.prices.name
         self._start = self.prices.index[0]
         self._end = self.prices.index[-1]
@@ -1638,8 +1707,254 @@ def calc_mean_var_weights(
     # return weight vector
     return pd.Series({returns.columns[i]: optimized.x[i] for i in range(n)})
 
+def calc_mean_var_weights_target_md(
+        returns, exp_rets, target_md, weight_bounds=(0.0, 1.0), constraints=None,
+        covar_method="standard", options=None
+):
+    """
+    Calculates the mean-variance weights given a DataFrame of returns
+    with the constraint of a target portfolio volatility.
 
-def _erc_weights_slsqp(x0, cov, b, maximum_iterations, tolerance):
+    Args:
+        * returns (DataFrame): Returns for multiple securities.
+        * target_volatility (float): The desired volatility of the portfolio.
+        * weight_bounds ((low, high)): Weight limits for optimization.
+        * covar_method (str): Covariance matrix estimation method.
+            Currently supported:
+                - `ledoit-wolf <http://www.ledoit.net/honey.pdf>`_
+                - standard
+        * options (dict): options for minimizing, e.g. {'maxiter': 10000 }
+
+    Returns:
+        Series {col_name: weight}
+
+    """
+
+    def objective(weights, exp_rets):
+        # portfolio mean
+        mean = sum(exp_rets * weights)
+        # negative because we want to maximize the portfolio mean
+        # and the optimizer minimizes metric
+        return -mean
+
+    def volatility_constraint(weights, covar, target_volatility):
+        # portfolio volatility
+        port_vol = np.sqrt(np.dot(np.dot(weights, covar), weights))
+        # we want to ensure our portfolio volatility is equal to the given number
+        return port_vol - target_volatility
+
+    n = len(returns.columns)
+
+    # calc covariance matrix
+    if covar_method == "ledoit-wolf":
+        covar = sklearn.covariance.ledoit_wolf(returns)[0]
+    elif covar_method == "standard":
+        covar = returns.cov()
+    else:
+        raise NotImplementedError("covar_method not implemented")
+
+    mv_frontier = get_mv_frontier(np.array(exp_rets), covar, 50, target_md, None)
+    target_volatility = mv_frontier['Optimal Portfolio Volatility']
+    target_return = mv_frontier['Optimal Arithmetic Portfolio Return']
+
+    weights = np.ones([n]) / n
+    bounds = [weight_bounds for i in range(n)]
+
+    constraints = [
+        {"type": "eq", "fun": lambda W: sum(W) - 1.0},  # sum of weights must be equal to 1
+        {"type": "eq", "fun": lambda W: volatility_constraint(W, covar, target_volatility)}  # volatility constraint
+    ]
+
+    optimized = minimize(
+        objective,
+        weights,
+        (exp_rets,),
+        method="SLSQP",
+        constraints=constraints,
+        bounds=bounds,
+        options={'maxiter': 1000, 'ftol': 1e-10}
+    )
+    # check if success
+    if not optimized.success:
+        raise Exception(optimized.message)
+
+    # return weight vector
+    return pd.Series({returns.columns[i]: optimized.x[i] for i in range(n)})
+
+def calc_two_stage_weights_target_md(
+        returns, exp_rets, target_md, epsilon, erc_weights, norm="l1", weight_bounds=(0.0, 1.0),
+        additional_constraints=None, covar_method="standard", periodicity=12, const_covar=None, options=None,
+):
+    def return_objective(weights, exp_rets):
+        # portfolio mean
+        mean = sum(exp_rets * weights)
+        # negative because we want to maximize the portfolio mean
+        # and the optimizer minimizes metric
+        return mean
+
+    def volatility_constraint(weights, covar, target_volatility):
+        # portfolio volatility
+        port_vol = np.sqrt(np.dot(np.dot(weights, covar), weights))
+        # we want to ensure our portfolio volatility is equal to the given number
+        return port_vol - target_volatility
+
+    def weight_objective(weight, weight_ref, norm):
+        weight = weight.reshape(-1, 1)
+        weight_ref = weight_ref.reshape(-1, 1)
+        if norm == 'l1':
+            return np.sum(np.abs(weight - weight_ref))
+        elif norm == 'l2':
+            return np.dot((weight - weight_ref).T, weight - weight_ref).squeeze()
+
+    exp_rets.dropna(inplace=True)
+    n = len(exp_rets)
+
+    # calc covariance matrix
+    if covar_method == "ledoit-wolf":
+        covar = sklearn.covariance.ledoit_wolf(returns)[0]
+    elif covar_method == "standard":
+        covar = returns.cov()
+    elif covar_method == "constant":
+        if const_covar is None:
+            raise ValueError("const_covar must be provided if covar_method is constant")
+        covar = const_covar.loc[list(exp_rets.index), list(exp_rets.index)]
+    else:
+        raise NotImplementedError("covar_method not implemented")
+
+    covar *= periodicity
+
+    if covar_method == "constant":
+        stds = np.sqrt(np.diag(covar))
+    else:
+        stds = returns.std() * np.sqrt(periodicity)
+    arithmetic_mu = exp_rets + np.square(stds) / 2
+
+    mv_frontier = get_mv_frontier(np.array(arithmetic_mu), covar, 50, target_md, None)
+    target_volatility = mv_frontier['Optimal Portfolio Volatility']
+    target_return = mv_frontier['Optimal Arithmetic Portfolio Return']
+
+    weights = np.ones([n]) / n
+    bounds = [weight_bounds for i in range(n)]
+
+    constraints = [
+        {"type": "eq", "fun": lambda W: sum(W) - 1.0},  # sum of weights must be equal to 1
+        {"type": "eq", "fun": lambda W: volatility_constraint(W, covar, target_volatility)}  # volatility constraint
+    ]
+
+    constraints = add_additional_constraints(constraints, additional_constraints)
+
+    mv_return_optimum = minimize(
+        return_objective,
+        weights,
+        (-arithmetic_mu,),
+        method="SLSQP",
+        constraints=constraints,
+        bounds=bounds,
+        options={'maxiter': 1000, 'ftol': 1e-10}
+    )
+    # check if success
+    if not mv_return_optimum.success:
+        raise Exception(mv_return_optimum.message)
+
+    target_return = -mv_return_optimum.fun
+
+    constraints = [
+        {"type": "eq", "fun": lambda w: sum(w) - 1.0},
+        {'type': 'ineq', 'fun': lambda w: return_objective(w, arithmetic_mu) - (1 - epsilon) * target_return},
+        {'type': 'eq', 'fun': lambda w: volatility_constraint(w, covar, target_volatility)}
+    ]
+
+    constraints = add_additional_constraints(constraints, additional_constraints)
+
+    weight_ref = np.array(erc_weights[list(exp_rets.index)])
+
+    optimum = minimize(
+        weight_objective, x0=weights, args=(weight_ref, norm), method='SLSQP',
+        constraints=constraints, bounds=bounds,
+        options={'maxiter': 1000, 'ftol': 1e-10}
+    )
+
+    twostage_weights = pd.Series({exp_rets.index[i]: optimum.x[i] for i in range(n)})
+    aligned_weights, aligned_mu = twostage_weights.align(arithmetic_mu, join='inner')
+    portfolio_properties = calculate_portfolio_properties(aligned_weights, aligned_mu, covar)
+
+    return twostage_weights, portfolio_properties
+
+def calc_current_caaf_weights(
+        returns, exp_rets, target_md, erc_weights, norm="l1", weight_bounds=(0.0, 1.0),
+        additional_constraints=None, covar_method="standard", periodicity=12,
+        const_covar=None, options=None,
+):
+    def return_objective(weights, exp_rets):
+        # portfolio mean
+        mean = sum(exp_rets * weights)
+        # negative because we want to maximize the portfolio mean
+        # and the optimizer minimizes metric
+        return mean
+
+    def volatility_constraint(weights, covar, target_volatility):
+        # portfolio volatility
+        port_vol = np.sqrt(np.dot(np.dot(weights, covar), weights))
+        # we want to ensure our portfolio volatility is equal to the given number
+        return port_vol - target_volatility
+
+    exp_rets.dropna(inplace=True)
+    n = len(exp_rets)
+
+    # calc covariance matrix
+    if covar_method == "ledoit-wolf":
+        covar = sklearn.covariance.ledoit_wolf(returns)[0]
+    elif covar_method == "standard":
+        covar = returns.cov()
+    elif covar_method == "constant":
+        if const_covar is None:
+            raise ValueError("const_covar must be provided if covar_method is constant")
+        covar = const_covar.loc[list(exp_rets.index), list(exp_rets.index)]
+    else:
+        raise NotImplementedError("covar_method not implemented")
+
+    covar *= periodicity
+
+    if covar_method == "constant":
+        stds = np.sqrt(np.diag(covar))
+    else:
+        stds = returns.std() * np.sqrt(periodicity)
+    arithmetic_mu = exp_rets + np.square(stds) / 2
+
+    mv_frontier = get_mv_frontier(np.array(arithmetic_mu), covar, 50, target_md, None)
+    target_volatility = mv_frontier['Optimal Portfolio Volatility']
+
+    weights = np.ones([n]) / n
+    bounds = [weight_bounds for i in range(n)]
+
+    constraints = [
+        {"type": "eq", "fun": lambda W: sum(W) - 1.0},  # sum of weights must be equal to 1
+        {"type": "eq", "fun": lambda W: volatility_constraint(W, covar, target_volatility)}  # volatility constraint
+    ]
+
+    constraints = add_additional_constraints(constraints, additional_constraints)
+
+    optimum = minimize(
+        return_objective,
+        weights,
+        (-arithmetic_mu,),
+        method="SLSQP",
+        constraints=constraints,
+        bounds=bounds,
+        options={'maxiter': 1000, 'ftol': 1e-10}
+    )
+    # check if success
+    if not optimum.success:
+        raise Exception(optimum.message)
+
+    caaf_weights = 0.5*erc_weights[exp_rets.index] + 0.5*optimum.x
+
+    aligned_weights, aligned_mu = caaf_weights.align(arithmetic_mu, join='inner')
+    portfolio_properties = calculate_portfolio_properties(aligned_weights, aligned_mu, covar)
+
+    return caaf_weights, portfolio_properties
+
+def _erc_weights_slsqp(x0, cov, b, maximum_iterations, tolerance, additional_constraints=None):
     """
     Calculates the equal risk contribution / risk parity weights given
         a DataFrame of returns.
@@ -1679,8 +1994,10 @@ def _erc_weights_slsqp(x0, cov, b, maximum_iterations, tolerance):
     # nonnegative
     bounds = [(0, None) for i in range(len(x0))]
     # sum of weights must be equal to 1
-    constraints = {"type": "eq", "fun": lambda W: sum(W) - 1.0}
+    constraints = [{"type": "eq", "fun": lambda W: sum(W) - 1.0}]
     options = {"maxiter": maximum_iterations}
+
+    constraints = add_additional_constraints(constraints, additional_constraints)
 
     optimized = minimize(
         fitness,
@@ -1755,7 +2072,6 @@ def _erc_weights_ccd(x0, cov, b, maximum_iterations, tolerance):
         "No solution found after {0} iterations.".format(maximum_iterations)
     )
 
-
 def calc_erc_weights(
     returns,
     initial_weights=None,
@@ -1764,6 +2080,8 @@ def calc_erc_weights(
     risk_parity_method="ccd",
     maximum_iterations=100,
     tolerance=1e-8,
+    additional_constraints=None,
+    const_covar=None,
 ):
     """
     Calculates the equal risk contribution / risk parity weights given a
@@ -1795,6 +2113,10 @@ def calc_erc_weights(
         covar = sklearn.covariance.ledoit_wolf(returns)[0]
     elif covar_method == "standard":
         covar = returns.cov().values
+    elif covar_method == "constant":
+        if const_covar is None:
+            raise ValueError("const_covar must be provided if covar_method is constant")
+        covar = const_covar
     else:
         raise NotImplementedError("covar_method not implemented")
 
@@ -1807,6 +2129,9 @@ def calc_erc_weights(
     if risk_weights is None:
         risk_weights = np.ones(n) / n
 
+    if additional_constraints is not None and risk_parity_method == "ccd":
+        raise ValueError("additional_constraints not supported with ccd method")
+
     # calc risk parity weights matrix
     if risk_parity_method == "ccd":
         # cyclical coordinate descent implementation
@@ -1816,14 +2141,14 @@ def calc_erc_weights(
     elif risk_parity_method == "slsqp":
         # scipys slsqp optimizer
         erc_weights = _erc_weights_slsqp(
-            initial_weights, covar, risk_weights, maximum_iterations, tolerance
+            initial_weights, covar, risk_weights, maximum_iterations, tolerance, additional_constraints
         )
 
     else:
         raise NotImplementedError("risk_parity_method not implemented")
 
     # return erc weights vector
-    return pd.Series(erc_weights, index=returns.columns, name="erc")
+    return pd.Series(erc_weights, index=covar.columns, name="erc")
 
 
 def get_num_days_required(
