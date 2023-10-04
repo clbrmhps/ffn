@@ -25,6 +25,9 @@ from analysis.drawdowns import endpoint_mdd_lookup
 from . import utils
 from .utils import fmtn, fmtp, fmtpn, get_freq_name
 
+from meucci.EffectiveBets import EffectiveBets
+from meucci.torsion import torsion
+
 try:
     import seaborn as sns
 
@@ -37,6 +40,9 @@ _PANDAS_TWO = Version(pd.__version__) >= Version("2")
 # module level variable, can be different for non traditional markets (eg. crypto - 360)
 TRADING_DAYS_PER_YEAR = 252
 
+def diversification_ratio_squared(w, sigma_port, standard_deviations):
+    return (np.dot(w, standard_deviations) / sigma_port) ** 2
+
 def calculate_portfolio_properties(caaf_weights, arithmetic_mu, covar):
     # Align weights and arithmetic mean returns
     aligned_weights, aligned_mu = caaf_weights.align(arithmetic_mu, join='inner')
@@ -47,11 +53,18 @@ def calculate_portfolio_properties(caaf_weights, arithmetic_mu, covar):
     portfolio_geo_mu = portfolio_arithmetic_mu - 0.5 * portfolio_sigma ** 2
     portfolio_md = endpoint_mdd_lookup(portfolio_geo_mu, portfolio_sigma, frequency='M', percentile=5)
 
+    div_ratio_squared = diversification_ratio_squared(aligned_weights, portfolio_sigma, np.sqrt(np.diag(covar)))
+
+    t_mt = torsion(covar, 'minimum-torsion', method='exact')
+    p, enb = EffectiveBets(aligned_weights.to_numpy(), covar.to_numpy(), t_mt)
+
     # Compile portfolio properties into a pandas Series
     portfolio_properties = pd.Series({
         'arithmetic_mu': portfolio_arithmetic_mu,
         'sigma': portfolio_sigma,
-        'md': portfolio_md
+        'md': portfolio_md,
+        'enb': enb[0, 0],
+        'div_ratio_sqrd': div_ratio_squared
     })
 
     return portfolio_properties
