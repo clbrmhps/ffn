@@ -1794,8 +1794,8 @@ def calc_mean_var_weights_target_md(
     # return weight vector
     return pd.Series({returns.columns[i]: optimized.x[i] for i in range(n)})
 
-def calc_two_stage_weights_target_md(
-        returns, exp_rets, target_md, epsilon, erc_weights, norm="l1", weight_bounds=(0.0, 1.0),
+def calc_two_stage_weights(
+        returns, exp_rets, target_md=None, target_volatility=None, epsilon=0, erc_weights=None, norm="l1", weight_bounds=(0.0, 1.0),
         additional_constraints=None, covar_method="standard", periodicity=12, const_covar=None, options=None,
 ):
     def return_objective(weights, exp_rets):
@@ -1818,6 +1818,9 @@ def calc_two_stage_weights_target_md(
             return np.sum(np.abs(weight - weight_ref))
         elif norm == 'l2':
             return np.dot((weight - weight_ref).T, weight - weight_ref).squeeze()
+
+    if target_md is not None and target_volatility is not None:
+        raise ValueError("Both target_md and target_volatility cannot be set.")
 
     exp_rets.dropna(inplace=True)
     n = len(exp_rets)
@@ -1842,9 +1845,9 @@ def calc_two_stage_weights_target_md(
         stds = returns.std() * np.sqrt(periodicity)
     arithmetic_mu = exp_rets + np.square(stds) / 2
 
-    mv_frontier = get_mv_frontier(np.array(arithmetic_mu), covar, 50, target_md, None)
-    target_volatility = mv_frontier['Optimal Portfolio Volatility']
-    target_return = mv_frontier['Optimal Arithmetic Portfolio Return']
+    if target_md is not None:
+        mv_frontier = get_mv_frontier(np.array(arithmetic_mu), covar, 50, target_md, None)
+        target_volatility = mv_frontier['Optimal Portfolio Volatility']
 
     weights = np.ones([n]) / n
     bounds = [weight_bounds for i in range(n)]
@@ -1894,9 +1897,9 @@ def calc_two_stage_weights_target_md(
     return twostage_weights, portfolio_properties
 
 def calc_current_caaf_weights(
-        returns, exp_rets, target_md, erc_weights, norm="l1", weight_bounds=(0.0, 1.0),
+        returns, exp_rets, target_md=None, target_volatility=None, erc_weights=None, norm="l1", weight_bounds=(0.0, 1.0),
         additional_constraints=None, covar_method="standard", periodicity=12,
-        const_covar=None, options=None,
+        const_covar=None, mode=None, options=None,
 ):
     def return_objective(weights, exp_rets):
         # portfolio mean
@@ -1910,6 +1913,9 @@ def calc_current_caaf_weights(
         port_vol = np.sqrt(np.dot(np.dot(weights, covar), weights))
         # we want to ensure our portfolio volatility is equal to the given number
         return port_vol - target_volatility
+
+    if target_md is not None and target_volatility is not None:
+        raise ValueError("Both target_md and target_volatility cannot be set.")
 
     exp_rets.dropna(inplace=True)
     n = len(exp_rets)
@@ -1934,8 +1940,9 @@ def calc_current_caaf_weights(
         stds = returns.std() * np.sqrt(periodicity)
     arithmetic_mu = exp_rets + np.square(stds) / 2
 
-    mv_frontier = get_mv_frontier(np.array(arithmetic_mu), covar, 50, target_md, None)
-    target_volatility = mv_frontier['Optimal Portfolio Volatility']
+    if target_md is not None:
+        mv_frontier = get_mv_frontier(np.array(arithmetic_mu), covar, 50, target_md, extra_constraints=additional_constraints)
+        target_volatility = mv_frontier['Optimal Portfolio Volatility']
 
     weights = np.ones([n]) / n
     bounds = [weight_bounds for i in range(n)]
@@ -1960,7 +1967,10 @@ def calc_current_caaf_weights(
     if not optimum.success:
         raise Exception(optimum.message)
 
-    caaf_weights = 0.5*erc_weights[exp_rets.index] + 0.5*optimum.x
+    if mode == "frontier":
+        caaf_weights = 0.5 * erc_weights[exp_rets.index] + 0.5 * optimum.x
+    elif mode == "optima":
+        caaf_weights = 0.5*erc_weights[exp_rets.index] + 0.5*mv_frontier["Optimal Portfolio Weights"]
 
     aligned_weights, aligned_mu = caaf_weights.align(arithmetic_mu, join='inner')
     portfolio_properties = calculate_portfolio_properties(aligned_weights, aligned_mu, covar)
